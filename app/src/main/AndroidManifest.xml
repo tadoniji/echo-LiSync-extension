@@ -51,5 +51,10 @@
         <meta-data
             android:name="update_url"
             android:value="${update_url}" />
+
+        <activity
+            android:name=".PermissionActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>
 </manifest>

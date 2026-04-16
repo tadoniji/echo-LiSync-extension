@@ -2,12 +2,15 @@ package dev.brahmkshatriya.echo.extension
 
 import dev.brahmkshatriya.echo.common.LyricsExtension
 import dev.brahmkshatriya.echo.common.MusicExtension
+import dev.brahmkshatriya.echo.common.TrackerExtension
 import dev.brahmkshatriya.echo.common.clients.TrackerClient
 import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.providers.LyricsExtensionsProvider
 import dev.brahmkshatriya.echo.common.providers.MusicExtensionsProvider
+import dev.brahmkshatriya.echo.common.providers.SettingsProvider
+import dev.brahmkshatriya.echo.common.providers.TrackerExtensionsProvider
 
-abstract class EDExtension : MusicExtensionsProvider, LyricsExtensionsProvider, TrackerClient {
+abstract class EDExtension : MusicExtensionsProvider, LyricsExtensionsProvider, TrackerExtensionsProvider, TrackerClient, SettingsProvider {
     override val requiredMusicExtensions = listOf<String>()
 
     var musicExtensionList: List<MusicExtension> = emptyList()
@@ -20,6 +23,13 @@ abstract class EDExtension : MusicExtensionsProvider, LyricsExtensionsProvider, 
     var lyricsExtensionList: List<LyricsExtension> = emptyList()
     override fun setLyricsExtensions(extensions: List<LyricsExtension>) {
         lyricsExtensionList = extensions
+    }
+
+    override val requiredTrackerExtensions = listOf<String>()
+
+    var trackerExtensionList: List<TrackerExtension> = emptyList()
+    override fun setTrackerExtensions(extensions: List<TrackerExtension>) {
+        trackerExtensionList = extensions
     }
 
     override suspend fun onTrackChanged(details: TrackDetails?) {}

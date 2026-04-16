@@ -74,8 +74,8 @@ class AndroidED : EDExtension() {
 
     private fun requestPermissions() {
         val context = getApp() ?: return
-        val intent = Intent(context, PermissionActivity::class.java)
-        intent.setPackage("dev.brahmkshatriya.echo.extension")
+        val intent = Intent()
+        intent.setComponent(android.content.ComponentName("dev.brahmkshatriya.echo.extension.LiSync", "dev.brahmkshatriya.echo.extension.PermissionActivity"))
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
     }

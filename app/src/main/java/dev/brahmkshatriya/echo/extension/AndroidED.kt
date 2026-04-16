@@ -1,6 +1,5 @@
 package dev.brahmkshatriya.echo.extension
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Application
 import android.bluetooth.BluetoothAdapter
@@ -11,15 +10,12 @@ import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
-import android.os.ParcelUuid
+import android.provider.Settings as AndroidSettings
 import android.util.Log
 import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.settings.Setting
@@ -41,61 +37,45 @@ class AndroidED : EDExtension() {
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private var bluetoothJob: Job? = null
-
-    // Gestion des invités et de leurs noms pour le contrôle
+    
+    // Gestion de la salle
     private val connectedClients = ConcurrentHashMap<String, BluetoothSocket>()
     private val clientNames = ConcurrentHashMap<String, String>()
     private var guestSocket: BluetoothSocket? = null
-
-    private val discoveredRooms = ConcurrentHashMap<String, String>()
+    
+    private val discoveredRooms = mutableMapOf<String, String>()
     private var _settings: Settings? = null
-    private var lastTrackDetails: TrackDetails? = null
+    private var lastTrack: TrackDetails? = null
+    private var isScanning = false
 
     private fun getApp(): Application? = runCatching {
         Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null) as Application
     }.getOrNull()
 
-    private val serviceUuid = UUID.fromString("4e532b6e-402a-4464-918b-57a554a938c4")
-    private val bleUuid = ParcelUuid(UUID.fromString("4e532b6e-402a-4464-918b-57a554a938c5"))
-
-    override suspend fun onInitialize() {
-        Log.d("LiSync", "Service pret")
+    private fun getBluetoothAdapter(): BluetoothAdapter? {
+        val context = getApp() ?: return null
+        return (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
     }
+
+    private val serviceUuid = UUID.fromString("4e532b6e-402a-4464-918b-57a554a938c4")
+    private val bleUuid = android.os.ParcelUuid(UUID.fromString("4e532b6e-402a-4464-918b-57a554a938c5"))
 
     private fun hasPermissions(): Boolean {
         val context = getApp() ?: return false
-        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) == 0 &&
+            context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_SCAN) == 0 &&
+            context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_ADVERTISE) == 0
         } else {
-            listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            context.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == 0
         }
-        return permissions.all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
     }
 
-    private fun requestPermissions() {
-        val context = getApp() ?: return
-        val intent = Intent()
-        intent.setComponent(android.content.ComponentName("dev.brahmkshatriya.echo.extension.LiSync", "dev.brahmkshatriya.echo.extension.PermissionActivity"))
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
-    }
+    override suspend fun onInitialize() { Log.d("LiSync", "Prêt") }
 
     private fun startBluetooth() {
-        if (!hasPermissions()) {
-            requestPermissions()
-            return
-        }
-
-        val adapter = (getApp()?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
-        if (adapter == null) {
-            Log.e("LiSync", "Bluetooth non supporté")
-            return
-        }
-        if (!adapter.isEnabled) {
-            Log.w("LiSync", "Bluetooth désactivé")
-            return
-        }
-
+        val adapter = getBluetoothAdapter()
+        if (adapter == null || !adapter.isEnabled || !hasPermissions()) return
         bluetoothJob?.cancel()
         bluetoothJob = scope.launch {
             if (isHost) startHostServer(adapter) else startGuestScan(adapter)
@@ -103,89 +83,42 @@ class AndroidED : EDExtension() {
     }
 
     private fun startHostServer(adapter: BluetoothAdapter) {
-        val advertiser = adapter.bluetoothLeAdvertiser
-        if (advertiser == null) {
-            Log.e("LiSync", "BLE Advertiser non disponible")
-        } else {
-            val settings = AdvertiseSettings.Builder()
-                .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-                .setConnectable(true).build()
-            val data = AdvertiseData.Builder()
-                .setIncludeDeviceName(true)
-                .addServiceUuid(bleUuid)
-                .build()
-
-            advertiser.startAdvertising(settings, data, object : AdvertiseCallback() {
-                override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                    Log.d("LiSync", "Salle Jam Ouverte (BLE)")
-                }
-
-                override fun onStartFailure(errorCode: Int) {
-                    Log.e("LiSync", "Echec Advertising BLE : $errorCode")
-                    if (errorCode == AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE) {
-                        // Réessayer sans le nom de l'appareil si trop gros
-                        val fallbackData = AdvertiseData.Builder().addServiceUuid(bleUuid).build()
-                        advertiser.startAdvertising(settings, fallbackData, this)
-                    }
-                }
-            })
-        }
-
+        val advertiser = adapter.bluetoothLeAdvertiser ?: return
+        val settings = AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY).setConnectable(true).build()
+        val data = AdvertiseData.Builder().setIncludeDeviceName(true).addServiceUuid(bleUuid).build()
+        advertiser.startAdvertising(settings, data, object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { Log.i("LiSync", "Hôte Actif") }
+        })
         scope.launch {
             runCatching {
                 val server = adapter.listenUsingRfcommWithServiceRecord("EchoJam", serviceUuid)
-                Log.d("LiSync", "Serveur RFCOMM démarré")
                 while (true) {
                     val socket = server.accept() ?: break
-                    if (allowNewConnections) {
-                        val deviceId = socket.remoteDevice.address
-                        connectedClients[deviceId] = socket
-                        clientNames[deviceId] = socket.remoteDevice.name ?: "Inconnu"
-                        Log.i("LiSync", "Nouveau client connecté : $deviceId")
-                        handleHostConnection(socket)
-                    } else {
-                        socket.close()
-                    }
+                    val deviceId = socket.remoteDevice.address
+                    connectedClients[deviceId] = socket
+                    clientNames[deviceId] = socket.remoteDevice.name ?: "Inconnu"
+                    handleHostComm(socket)
                 }
-            }.onFailure {
-                Log.e("LiSync", "Erreur serveur RFCOMM", it)
             }
         }
     }
 
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val name = result.scanRecord?.deviceName ?: result.device.name ?: "Salle Echo"
-            discoveredRooms[result.device.address] = name
-            Log.d("LiSync", "Salle trouvée : $name (${result.device.address})")
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            Log.e("LiSync", "Echec Scan BLE : $errorCode")
-        }
-    }
-
     private fun startGuestScan(adapter: BluetoothAdapter) {
-        val scanner = adapter.bluetoothLeScanner ?: return
-        discoveredRooms.clear()
-        
-        val filter = ScanFilter.Builder().setServiceUuid(bleUuid).build()
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-
-        Log.d("LiSync", "Démarrage du scan BLE")
-        scanner.startScan(listOf(filter), settings, scanCallback)
-        
-        // Arrêter le scan après 30 secondes pour économiser la batterie
-        scope.launch {
-            delay(30000)
-            scanner.stopScan(scanCallback)
-            Log.d("LiSync", "Scan BLE arrêté après timeout")
+        if (isScanning) return
+        isScanning = true
+        val scanner = adapter.bluetoothLeScanner
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                if (result.scanRecord?.serviceUuids?.contains(bleUuid) == true) {
+                    discoveredRooms[result.device.address] = result.scanRecord?.deviceName ?: result.device.name ?: "Salle"
+                }
+            }
         }
+        scanner?.startScan(callback)
+        scope.launch { delay(10000); scanner?.stopScan(callback); isScanning = false }
     }
 
-    private fun handleHostConnection(socket: BluetoothSocket) {
+    private fun handleHostComm(socket: BluetoothSocket) {
         val deviceId = socket.remoteDevice.address
         scope.launch {
             runCatching {
@@ -194,165 +127,119 @@ class AndroidED : EDExtension() {
                 while (true) {
                     val bytes = input.read(buffer)
                     if (bytes <= 0) break
-                    val msg = String(buffer, 0, bytes)
-
-                    if (msg == "NEED_INFO" && lastTrackDetails != null) {
-                        val track = lastTrackDetails!!.track
-                        val info = "INFO|${track.title}|${track.artists.firstOrNull()?.name ?: ""}"
-                        socket.outputStream.write(info.toByteArray())
+                    if (String(buffer, 0, bytes) == "NEED_INFO") {
+                        lastTrack?.let {
+                            val info = "INFO|${it.track.title}|${it.track.artists.firstOrNull()?.name ?: ""}"
+                            socket.outputStream.write(info.toByteArray())
+                        }
                     }
                 }
             }
             connectedClients.remove(deviceId)
             clientNames.remove(deviceId)
-            Log.i("LiSync", "Client déconnecté : $deviceId")
         }
     }
 
     private fun connectToJam(address: String) {
-        if (address == "none" || address.isBlank()) return
-        Log.i("LiSync", "Tentative de connexion à : $address")
+        if (address == "none") return
         scope.launch {
             runCatching {
-                val adapter = (getApp()?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
-                val device = adapter?.getRemoteDevice(address) ?: return@launch
-                guestSocket?.close()
-                val socket = device.createRfcommSocketToServiceRecord(serviceUuid)
-                socket.connect()
+                val socket = getBluetoothAdapter()?.getRemoteDevice(address)?.createRfcommSocketToServiceRecord(serviceUuid)
+                socket?.connect()
                 guestSocket = socket
-                Log.i("LiSync", "Connecté à la salle RFCOMM")
-                handleGuestConnection(socket)
-            }.onFailure {
-                Log.e("LiSync", "Erreur connexion à $address", it)
-            }
-        }
-    }
-
-    private fun handleGuestConnection(socket: BluetoothSocket) {
-        scope.launch {
-            runCatching {
-                val input = socket.inputStream
+                val input = socket?.inputStream
                 val buffer = ByteArray(1024)
                 while (true) {
-                    val bytes = input.read(buffer)
-                    if (bytes <= 0) break
-                    processReceivedMessage(String(buffer, 0, bytes))
+                    val bytes = input?.read(buffer) ?: break
+                    if (bytes > 0) processGuestMessage(String(buffer, 0, bytes))
                 }
             }
             guestSocket = null
-            Log.i("LiSync", "Déconnecté de la salle")
         }
     }
 
-    private fun processReceivedMessage(msg: String) {
+    private fun processGuestMessage(msg: String) {
         val parts = msg.split("|")
-        if (parts.isEmpty()) return
-
+        if (parts.size < 2) return
         when (parts[0]) {
             "TRACK" -> {
-                val trackId = parts[1]
-                Log.i("LiSync", "Tentative Sync ID : $trackId")
-                if (!launchUri("echo://track/${Uri.encode(trackId)}")) {
-                    sendToHost("NEED_INFO")
+                if (!launchUri("echo://track/${Uri.encode(parts[1])}")) {
+                    scope.launch { runCatching { guestSocket?.outputStream?.write("NEED_INFO".toByteArray()) } }
                 }
             }
-            "INFO" -> {
-                val title = parts.getOrNull(1) ?: ""
-                val artist = parts.getOrNull(2) ?: ""
-                Log.i("LiSync", "Fallback Recherche : $title")
-                launchUri("echo://search?query=${Uri.encode("$title $artist")}")
-            }
-            "STATE" -> {
-                val action = if (parts[1] == "PLAY") "play" else "pause"
-                launchUri("echo://$action")
-            }
+            "INFO" -> launchUri("echo://search?query=${Uri.encode("${parts[1]} ${parts[2]}")}")
+            "STATE" -> launchUri("echo://${if (parts[1] == "PLAY") "play" else "pause"}")
         }
     }
 
     private fun launchUri(uri: String): Boolean {
-        val context = getApp() ?: return false
-        return try {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri))
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(intent)
+        return runCatching {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            getApp()?.startActivity(intent)
             true
-        } catch (e: Exception) { false }
-    }
-
-    private fun sendToAllInvites(message: String) {
-        connectedClients.values.forEach { socket ->
-            scope.launch { runCatching { socket.outputStream.write(message.toByteArray()) } }
-        }
-    }
-
-    private fun sendToHost(message: String) {
-        scope.launch { runCatching { guestSocket?.outputStream?.write(message.toByteArray()) } }
+        }.getOrDefault(false)
     }
 
     override suspend fun onTrackChanged(details: TrackDetails?) {
-        lastTrackDetails = details
-        if (roomEnabled && isHost && details != null) {
-            sendToAllInvites("TRACK|${details.track.id}")
+        lastTrack = details
+        if (roomEnabled && isHost) {
+            val msg = "TRACK|${details?.track?.id}"
+            connectedClients.values.forEach { runCatching { it.outputStream.write(msg.toByteArray()) } }
         }
     }
 
     override suspend fun onPlayingStateChanged(details: TrackDetails?, isPlaying: Boolean) {
-        if (roomEnabled && isHost && details != null) {
-            sendToAllInvites("STATE|${if (isPlaying) "PLAY" else "PAUSE"}")
+        if (roomEnabled && isHost) {
+            val msg = "STATE|${if (isPlaying) "PLAY" else "PAUSE"}"
+            connectedClients.values.forEach { runCatching { it.outputStream.write(msg.toByteArray()) } }
         }
     }
 
     override fun setSettings(settings: Settings) {
-        val oldRoomEnabled = roomEnabled
+        if (settings.getBoolean("fix_perms") == true) runCatching {
+            getApp()?.startActivity(Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", getApp()?.packageName, null)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
+        if (settings.getBoolean("refresh_scan") == true) startBluetooth()
+        
         _settings = settings
-
-        if (roomEnabled) {
-            val joinAddress = settings.getString(JOIN_ADDRESS)
-            if (!isHost && joinAddress != null && joinAddress != "none") {
-                if (guestSocket?.remoteDevice?.address != joinAddress) {
-                    connectToJam(joinAddress)
-                }
-            }
-            startBluetooth()
-        } else if (oldRoomEnabled) {
+        if (roomEnabled) startBluetooth() else {
             bluetoothJob?.cancel()
             connectedClients.values.forEach { runCatching { it.close() } }
             connectedClients.clear()
             runCatching { guestSocket?.close() }
-            val adapter = (getApp()?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
-            adapter?.bluetoothLeScanner?.stopScan(scanCallback)
         }
     }
 
     override suspend fun getSettingItems(): List<Setting> {
-        val names = if (discoveredRooms.isEmpty()) listOf("Scan en cours...") else discoveredRooms.values.toList()
-        val ids = if (discoveredRooms.isEmpty()) listOf("none") else discoveredRooms.keys.toList()
-
-        val guestsList = if (clientNames.isEmpty()) "Aucun invité" else clientNames.values.joinToString(", ")
-
-        val syncDescription = if (hasPermissions()) "Synchronisation à proximité" else "⚠️ Permissions manquantes - Cliquer pour corriger"
+        val adapter = getBluetoothAdapter()
+        val btOk = adapter?.isEnabled == true
+        val permOk = hasPermissions()
+        val status = when {
+            !btOk -> "❌ Bluetooth désactivé"
+            !permOk -> "⚠️ Permissions manquantes"
+            else -> "✅ Prêt"
+        }
+        val guests = if (clientNames.isEmpty()) "Aucun" else clientNames.values.joinToString(", ")
+        val rooms = if (discoveredRooms.isEmpty()) listOf("Lancer une recherche...") else discoveredRooms.values.toList()
+        val roomIds = if (discoveredRooms.isEmpty()) listOf("none") else discoveredRooms.keys.toList()
 
         return listOf(
-            SettingCategory("Salle LiSync Jam", "sync", mutableListOf(
-                SettingSwitch("Activer LiSync", ROOM_ENABLED, syncDescription, false),
-                SettingSwitch("Être l'Hôte", IS_HOST, "Partager ma lecture", true),
-                SettingSwitch("Porte Ouverte", ALLOW_CONN, "Autoriser de nouveaux invités", true),
-                SettingList("Rejoindre une salle", JOIN_ADDRESS, "Salles détectées", names, ids, 0)
+            SettingCategory("Statut : $status", "st", mutableListOf(
+                SettingSwitch("Réparer les permissions", "fix_perms", "Ouvre les réglages Android", false),
+                SettingSwitch(if (isScanning) "Recherche..." else "Rechercher des salles", "refresh_scan", "Scan manuel", false)
             )),
-            SettingCategory("Contrôle", "control", mutableListOf(
-                SettingSwitch("Salle Privée", "lock_room", "Connectés : $guestsList", false)
+            SettingCategory("Ma Salle", "sync", mutableListOf(
+                SettingSwitch("Activer LiSync", "room_enabled", "Session en cours", false),
+                SettingSwitch("Mode Hôte", "is_host", "Diffuser ma musique", true),
+                SettingList("Rejoindre une salle", "join_address", "Salles trouvées", rooms, roomIds, 0)
+            )),
+            SettingCategory("Contrôle Hôte", "ctrl", mutableListOf(
+                SettingSwitch("Salle Privée", "lock", "Invités connectés : $guests", false)
             ))
         )
     }
 
-    private val roomEnabled get() = _settings?.getBoolean(ROOM_ENABLED) ?: false
-    private val isHost get() = _settings?.getBoolean(IS_HOST) ?: true
-    private val allowNewConnections get() = _settings?.getBoolean(ALLOW_CONN) ?: true
-
-    companion object {
-        private const val ROOM_ENABLED = "room_enabled"
-        private const val IS_HOST = "is_host"
-        private const val JOIN_ADDRESS = "join_address"
-        private const val ALLOW_CONN = "allow_new_conn"
-    }
+    private val roomEnabled get() = _settings?.getBoolean("room_enabled") ?: false
+    private val isHost get() = _settings?.getBoolean("is_host") ?: true
+    companion object { private const val JOIN_ADDRESS = "join_address" }
 }

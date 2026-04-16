@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
@@ -28,7 +27,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -37,16 +35,17 @@ class AndroidED : EDExtension() {
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
     private var bluetoothJob: Job? = null
-    
-    // Gestion de la salle
     private val connectedClients = ConcurrentHashMap<String, BluetoothSocket>()
     private val clientNames = ConcurrentHashMap<String, String>()
     private var guestSocket: BluetoothSocket? = null
-    
     private val discoveredRooms = mutableMapOf<String, String>()
     private var _settings: Settings? = null
     private var lastTrack: TrackDetails? = null
     private var isScanning = false
+    private var lastStatus = "Prêt"
+
+    // ID de l'extension pour ouvrir ses paramètres propres
+    private val EXT_PACKAGE = "dev.brahmkshatriya.echo.extension.LiSync"
 
     private fun getApp(): Application? = runCatching {
         Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null) as Application
@@ -54,7 +53,9 @@ class AndroidED : EDExtension() {
 
     private fun getBluetoothAdapter(): BluetoothAdapter? {
         val context = getApp() ?: return null
-        return (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+        // Double détection pour Huawei : Manager system + Default adapter
+        val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        return manager?.adapter ?: BluetoothAdapter.getDefaultAdapter()
     }
 
     private val serviceUuid = UUID.fromString("4e532b6e-402a-4464-918b-57a554a938c4")
@@ -71,7 +72,7 @@ class AndroidED : EDExtension() {
         }
     }
 
-    override suspend fun onInitialize() { Log.d("LiSync", "Prêt") }
+    override suspend fun onInitialize() { lastStatus = "LiSync est prêt" }
 
     private fun startBluetooth() {
         val adapter = getBluetoothAdapter()
@@ -87,16 +88,15 @@ class AndroidED : EDExtension() {
         val settings = AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY).setConnectable(true).build()
         val data = AdvertiseData.Builder().setIncludeDeviceName(true).addServiceUuid(bleUuid).build()
         advertiser.startAdvertising(settings, data, object : AdvertiseCallback() {
-            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { Log.i("LiSync", "Hôte Actif") }
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { lastStatus = "Partage en cours..." }
         })
         scope.launch {
             runCatching {
                 val server = adapter.listenUsingRfcommWithServiceRecord("EchoJam", serviceUuid)
                 while (true) {
                     val socket = server.accept() ?: break
-                    val deviceId = socket.remoteDevice.address
-                    connectedClients[deviceId] = socket
-                    clientNames[deviceId] = socket.remoteDevice.name ?: "Inconnu"
+                    connectedClients[socket.remoteDevice.address] = socket
+                    clientNames[socket.remoteDevice.address] = socket.remoteDevice.name ?: "Ami"
                     handleHostComm(socket)
                 }
             }
@@ -106,20 +106,20 @@ class AndroidED : EDExtension() {
     private fun startGuestScan(adapter: BluetoothAdapter) {
         if (isScanning) return
         isScanning = true
+        lastStatus = "Recherche d'amis..."
         val scanner = adapter.bluetoothLeScanner
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 if (result.scanRecord?.serviceUuids?.contains(bleUuid) == true) {
-                    discoveredRooms[result.device.address] = result.scanRecord?.deviceName ?: result.device.name ?: "Salle"
+                    discoveredRooms[result.device.address] = result.scanRecord?.deviceName ?: result.device.name ?: "Salle Echo"
                 }
             }
         }
         scanner?.startScan(callback)
-        scope.launch { delay(10000); scanner?.stopScan(callback); isScanning = false }
+        scope.launch { delay(8000); scanner?.stopScan(callback); isScanning = false }
     }
 
     private fun handleHostComm(socket: BluetoothSocket) {
-        val deviceId = socket.remoteDevice.address
         scope.launch {
             runCatching {
                 val input = socket.inputStream
@@ -135,18 +135,20 @@ class AndroidED : EDExtension() {
                     }
                 }
             }
-            connectedClients.remove(deviceId)
-            clientNames.remove(deviceId)
+            connectedClients.remove(socket.remoteDevice.address)
+            clientNames.remove(socket.remoteDevice.address)
         }
     }
 
     private fun connectToJam(address: String) {
-        if (address == "none") return
+        if (address == "none" || address == "re-scan") return
         scope.launch {
+            lastStatus = "Connexion..."
             runCatching {
                 val socket = getBluetoothAdapter()?.getRemoteDevice(address)?.createRfcommSocketToServiceRecord(serviceUuid)
                 socket?.connect()
                 guestSocket = socket
+                lastStatus = "Connecté !"
                 val input = socket?.inputStream
                 val buffer = ByteArray(1024)
                 while (true) {
@@ -162,23 +164,19 @@ class AndroidED : EDExtension() {
         val parts = msg.split("|")
         if (parts.size < 2) return
         when (parts[0]) {
-            "TRACK" -> {
-                if (!launchUri("echo://track/${Uri.encode(parts[1])}")) {
-                    scope.launch { runCatching { guestSocket?.outputStream?.write("NEED_INFO".toByteArray()) } }
-                }
+            "TRACK" -> if (!launchUri("echo://track/${Uri.encode(parts[1])}")) {
+                scope.launch { runCatching { guestSocket?.outputStream?.write("NEED_INFO".toByteArray()) } }
             }
             "INFO" -> launchUri("echo://search?query=${Uri.encode("${parts[1]} ${parts[2]}")}")
             "STATE" -> launchUri("echo://${if (parts[1] == "PLAY") "play" else "pause"}")
         }
     }
 
-    private fun launchUri(uri: String): Boolean {
-        return runCatching {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            getApp()?.startActivity(intent)
-            true
-        }.getOrDefault(false)
-    }
+    private fun launchUri(uri: String): Boolean = runCatching {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        getApp()?.startActivity(intent)
+        true
+    }.getOrDefault(false)
 
     override suspend fun onTrackChanged(details: TrackDetails?) {
         lastTrack = details
@@ -196,11 +194,13 @@ class AndroidED : EDExtension() {
     }
 
     override fun setSettings(settings: Settings) {
-        if (settings.getBoolean("fix_perms") == true) runCatching {
-            getApp()?.startActivity(Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", getApp()?.packageName, null)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        if (settings.getString("btn_fix") == "fix") runCatching {
+            val intent = Intent(AndroidSettings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", EXT_PACKAGE, null))
+            getApp()?.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
-        if (settings.getBoolean("refresh_scan") == true) startBluetooth()
-        
+        val joinAddress = settings.getString(JOIN_ADDRESS)
+        if (joinAddress == "re-scan") startBluetooth()
+        else if (roomEnabled && !isHost && joinAddress != null) connectToJam(joinAddress)
         _settings = settings
         if (roomEnabled) startBluetooth() else {
             bluetoothJob?.cancel()
@@ -212,29 +212,26 @@ class AndroidED : EDExtension() {
 
     override suspend fun getSettingItems(): List<Setting> {
         val adapter = getBluetoothAdapter()
-        val btOk = adapter?.isEnabled == true
-        val permOk = hasPermissions()
         val status = when {
-            !btOk -> "❌ Bluetooth désactivé"
-            !permOk -> "⚠️ Permissions manquantes"
-            else -> "✅ Prêt"
+            adapter?.isEnabled != true -> "❌ Bluetooth OFF"
+            !hasPermissions() -> "⚠️ Permissions"
+            else -> "✅ $lastStatus"
         }
-        val guests = if (clientNames.isEmpty()) "Aucun" else clientNames.values.joinToString(", ")
-        val rooms = if (discoveredRooms.isEmpty()) listOf("Lancer une recherche...") else discoveredRooms.values.toList()
-        val roomIds = if (discoveredRooms.isEmpty()) listOf("none") else discoveredRooms.keys.toList()
+        val rooms = mutableListOf("🔄 Lancer une recherche")
+        val roomIds = mutableListOf("re-scan")
+        discoveredRooms.forEach { (addr, name) -> rooms.add(name); roomIds.add(addr) }
 
         return listOf(
             SettingCategory("Statut : $status", "st", mutableListOf(
-                SettingSwitch("Réparer les permissions", "fix_perms", "Ouvre les réglages Android", false),
-                SettingSwitch(if (isScanning) "Recherche..." else "Rechercher des salles", "refresh_scan", "Scan manuel", false)
+                SettingList("⚙️ Réparer les permissions", "btn_fix", "Ouvre les paramètres système de LiSync", listOf("Cliquer pour ouvrir"), listOf("fix"), 0)
             )),
-            SettingCategory("Ma Salle", "sync", mutableListOf(
-                SettingSwitch("Activer LiSync", "room_enabled", "Session en cours", false),
+            SettingCategory("Session Jam", "sync", mutableListOf(
+                SettingSwitch("Activer LiSync", "room_enabled", "Partager ou rejoindre", false),
                 SettingSwitch("Mode Hôte", "is_host", "Diffuser ma musique", true),
-                SettingList("Rejoindre une salle", "join_address", "Salles trouvées", rooms, roomIds, 0)
+                SettingList("🤝 Rejoindre une salle", JOIN_ADDRESS, "Salles détectées", rooms, roomIds, 0)
             )),
-            SettingCategory("Contrôle Hôte", "ctrl", mutableListOf(
-                SettingSwitch("Salle Privée", "lock", "Invités connectés : $guests", false)
+            SettingCategory("Contrôle", "ctrl", mutableListOf(
+                SettingSwitch("Salle Privée", "lock", "Invités : ${clientNames.size}", false)
             ))
         )
     }

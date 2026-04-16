@@ -53,7 +53,7 @@
             android:value="${update_url}" />
 
         <activity
-            android:name=".PermissionActivity"
+            android:name="dev.brahmkshatriya.echo.extension.PermissionActivity"
             android:exported="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>

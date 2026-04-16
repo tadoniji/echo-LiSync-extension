@@ -324,27 +324,26 @@ class AndroidED : EDExtension() {
         }
     }
 
-    override val settingItems: List<Setting>
-        get() {
-            val names = if (discoveredRooms.isEmpty()) listOf("Scan en cours...") else discoveredRooms.values.toList()
-            val ids = if (discoveredRooms.isEmpty()) listOf("none") else discoveredRooms.keys.toList()
+    override suspend fun getSettingItems(): List<Setting> {
+        val names = if (discoveredRooms.isEmpty()) listOf("Scan en cours...") else discoveredRooms.values.toList()
+        val ids = if (discoveredRooms.isEmpty()) listOf("none") else discoveredRooms.keys.toList()
 
-            val guestsList = if (clientNames.isEmpty()) "Aucun invité" else clientNames.values.joinToString(", ")
+        val guestsList = if (clientNames.isEmpty()) "Aucun invité" else clientNames.values.joinToString(", ")
 
-            val syncDescription = if (hasPermissions()) "Synchronisation à proximité" else "⚠️ Permissions manquantes - Cliquer pour corriger"
+        val syncDescription = if (hasPermissions()) "Synchronisation à proximité" else "⚠️ Permissions manquantes - Cliquer pour corriger"
 
-            return listOf(
-                SettingCategory("Salle LiSync Jam", "sync", mutableListOf(
-                    SettingSwitch("Activer LiSync", ROOM_ENABLED, syncDescription, false),
-                    SettingSwitch("Être l'Hôte", IS_HOST, "Partager ma lecture", true),
-                    SettingSwitch("Porte Ouverte", ALLOW_CONN, "Autoriser de nouveaux invités", true),
-                    SettingList("Rejoindre une salle", JOIN_ADDRESS, "Salles détectées", names, ids, 0)
-                )),
-                SettingCategory("Contrôle", "control", mutableListOf(
-                    SettingSwitch("Salle Privée", "lock_room", "Connectés : $guestsList", false)
-                ))
-            )
-        }
+        return listOf(
+            SettingCategory("Salle LiSync Jam", "sync", mutableListOf(
+                SettingSwitch("Activer LiSync", ROOM_ENABLED, syncDescription, false),
+                SettingSwitch("Être l'Hôte", IS_HOST, "Partager ma lecture", true),
+                SettingSwitch("Porte Ouverte", ALLOW_CONN, "Autoriser de nouveaux invités", true),
+                SettingList("Rejoindre une salle", JOIN_ADDRESS, "Salles détectées", names, ids, 0)
+            )),
+            SettingCategory("Contrôle", "control", mutableListOf(
+                SettingSwitch("Salle Privée", "lock_room", "Connectés : $guestsList", false)
+            ))
+        )
+    }
 
     private val roomEnabled get() = _settings?.getBoolean(ROOM_ENABLED) ?: false
     private val isHost get() = _settings?.getBoolean(IS_HOST) ?: true
